@@ -1,0 +1,127 @@
+# Infrastructure Configuration Template
+#
+# Configuration skeleton for the MCP Tool Access Pattern.
+# Replace placeholder values with your environment-specific settings.
+#
+# Usage: Copy this file as your infrastructure configuration input.
+# This is a template artifact — not executable configuration.
+
+# =====================================================================
+# Environment
+# =====================================================================
+environment:
+  name: production           # development | staging | production
+  account: "YOUR_CLOUD_ACCOUNT_ID"   # Cloud account ID (replace)
+  region: us-east-1          # Deployment region (replace)
+
+# =====================================================================
+# Networking Layer
+# =====================================================================
+foundation:
+  virtual_network:
+    cidr: "10.0.0.0/16"
+    availability_zones: 2
+    nat_gateways: 1          # Set to 2+ for production HA
+    # Subnet allocation:
+    # - Public subnets:  /24 each (NAT gateway, load balancer if needed)
+    # - Private subnets: /20 each (serverless compute, filesystem mount targets)
+
+  tags:
+    project: mcp-tool-access
+    environment: production
+    owner: platform-team      # Replace with your team
+
+# =====================================================================
+# Data Layer
+# =====================================================================
+storage:
+  durable_storage:
+    name_suffix: search-indexes   # Naming convention: {account}-{region}-{suffix}
+    versioning: true
+    encryption: AES256            # Or provider-managed KMS
+    lifecycle:
+      transition_to_cold_days: 90
+      expire_noncurrent_days: 365
+
+  shared_filesystem:
+    performance_mode: general     # or high-throughput
+    throughput_mode: bursting     # or provisioned
+    # provisioned_throughput_mibps: 100  # Uncomment if using provisioned mode
+    encryption_at_rest: true
+    encryption_in_transit: true
+
+  replication:
+    schedule: "rate(1 hour)"      # How often to sync durable → hot cache
+    options:
+      overwrite_mode: always
+      verify_mode: transferred_files_only
+      log_level: transfer         # off | basic | transfer
+
+# =====================================================================
+# Processing Layer
+# =====================================================================
+compute:
+  serverless_function:
+    runtime: compiled_binary      # Compiled language recommended for cold starts
+    architecture: arm64           # ARM preferred for cost efficiency
+    memory_mb: 2048               # Tune based on index size and query complexity
+    timeout_seconds: 30
+    max_concurrency: 50           # Max concurrent executions
+    # provisioned_concurrency: 5  # Uncomment to reduce cold starts
+    environment:
+      INDEX_PATH: /mnt/indexes
+      LOG_LEVEL: info             # debug | info | warn | error
+      # PAGINATION_TABLE auto-resolved from stack outputs
+
+  api_gateway:
+    stage: prod
+    auth: cloud_native_iam        # Cloud-native IAM authentication
+    throttling:
+      rate_limit: 100             # Requests per second (steady state)
+      burst_limit: 200            # Maximum burst
+    logging:
+      access_log: true
+      execution_log: false        # Enable for debugging only (verbose)
+
+  pagination_store:
+    name_suffix: pagination-cursors
+    ttl_seconds: 900              # 15 minutes; cursors expire after this
+    billing_mode: on_demand
+
+# =====================================================================
+# Access Control Layer (optional — for external agent platforms)
+# =====================================================================
+gateway:
+  enabled: false                  # Set to true if external clients need token-based access
+  token_auth:
+    token_endpoint: "https://auth.example.com/oauth2/token"  # Replace
+    scopes:
+      - search:read
+      - docs:read
+  usage_plan:
+    rate_limit: 50
+    burst_limit: 100
+    daily_quota: 10000
+  client_keys:
+    - name: agent-platform-1      # Replace with actual client names
+    - name: agent-platform-2
+
+# =====================================================================
+# Monitoring
+# =====================================================================
+monitoring:
+  logging:
+    retention_days: 30            # 7 | 14 | 30 | 60 | 90 | 180 | 365
+  alarms:
+    error_rate:
+      threshold_percent: 5
+      evaluation_periods: 3
+      period_seconds: 300
+    latency_p99:
+      threshold_ms: 5000
+      evaluation_periods: 3
+      period_seconds: 300
+    throttle_count:
+      threshold: 10
+      evaluation_periods: 1
+      period_seconds: 60

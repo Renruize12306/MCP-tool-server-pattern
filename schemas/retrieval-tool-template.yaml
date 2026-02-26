@@ -1,0 +1,204 @@
+# MCP Tool Template: Knowledge Retrieval Domain
+#
+# Abstract template for building MCP tool contracts in the knowledge
+# retrieval domain. A retrieval-domain MCP server provides agents with
+# access to document stores — runbooks, wikis, policies, configuration
+# files, or any corpus of semi-structured text.
+#
+# Unlike search-domain servers (which query indexed data through a
+# backend compute service), retrieval servers typically access object
+# storage or document APIs directly, since the operations are simple
+# reads without compute-intensive indexing.
+#
+# Replace {{placeholders}} with domain-specific values.
+#
+# Protocol: Model Context Protocol (MCP)
+# Transport: stdio (local) or HTTP+SSE (cloud)
+
+server:
+  name: "{{domain}}-retrieval-mcp"
+  version: "{{semver}}"
+  description: >
+    Provides AI agents with access to {{domain}} documents.
+    Supports listing, keyword search over metadata, and
+    full content retrieval.
+
+# -----------------------------------------------------------------------
+# Tool Categories
+# -----------------------------------------------------------------------
+# Retrieval-domain MCP servers typically expose three tools:
+#
+#   1. List      — enumerate available documents with metadata
+#   2. Search    — keyword-based search over document metadata
+#   3. Retrieve  — fetch the full content of a specific document
+
+tool_templates:
+
+  # --- Category 1: List ---
+  - category: list
+    description: >
+      Enumerate available documents with metadata. Supports filtering
+      by domain-specific attributes (service, category, severity, etc.).
+    schema_pattern:
+      name: "list_{{document_plural}}"
+      input_schema:
+        type: object
+        properties:
+          "{{filter_field_1}}":
+            type: string
+            description: "Filter by {{filter_description_1}}"
+          "{{filter_field_2}}":
+            type: string
+            enum: "{{allowed_values}}"
+            description: "Filter by {{filter_description_2}}"
+          limit:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+          offset:
+            type: integer
+            default: 0
+        required: []
+      output_schema:
+        type: array
+        items:
+          type: object
+          properties:
+            id:
+              type: string
+              description: Unique document identifier
+            title:
+              type: string
+            "{{domain_field}}":
+              type: string
+              description: "Domain-specific classification"
+            last_updated:
+              type: string
+              format: date-time
+            author:
+              type: string
+            tags:
+              type: array
+              items:
+                type: string
+    pagination_note: >
+      Offset-based pagination is acceptable for retrieval-domain servers
+      where the document corpus is small (hundreds to low thousands) and
+      changes infrequently. For larger or rapidly changing corpora, use
+      cursor-based pagination instead (see search-tool-template.yaml).
+
+  # --- Category 2: Metadata Search ---
+  - category: metadata_search
+    description: >
+      Keyword-based search over document metadata (titles, tags,
+      classifications). This is a lightweight operation performed
+      against a cached metadata index — not a full-text search.
+    schema_pattern:
+      name: "search_{{document}}_metadata"
+      input_schema:
+        type: object
+        properties:
+          keywords:
+            type: string
+            description: >
+              Space-separated keywords matched against document
+              titles, tags, and domain-specific fields.
+          limit:
+            type: integer
+            default: 20
+        required: [keywords]
+      output_schema:
+        type: array
+        items:
+          type: object
+          properties:
+            id:
+              type: string
+            title:
+              type: string
+            relevance_score:
+              type: number
+              description: Relevance score (higher = more relevant)
+            snippet:
+              type: string
+              description: Short excerpt showing keyword match context
+
+  # --- Category 3: Content Retrieval ---
+  - category: content_retrieval
+    description: >
+      Fetch the full content of a specific document by ID.
+      Returns the document body along with metadata.
+    schema_pattern:
+      name: "get_{{document}}"
+      input_schema:
+        type: object
+        properties:
+          "{{document}}_id":
+            type: string
+            description: "Unique identifier of the {{document}} to retrieve"
+        required: ["{{document}}_id"]
+      output_schema:
+        type: object
+        properties:
+          id:
+            type: string
+          title:
+            type: string
+          content:
+            type: string
+            description: "Full document content (typically Markdown)"
+          metadata:
+            type: object
+            description: >
+              Domain-specific metadata (author, timestamps, tags,
+              classification, related documents, etc.)
+          related_ids:
+            type: array
+            items:
+              type: string
+            description: IDs of related documents for agent follow-up
+
+# -----------------------------------------------------------------------
+# Error Schema
+# -----------------------------------------------------------------------
+
+error_schemas:
+  - code: INVALID_PARAMS
+    json_rpc_code: -32602
+    description: >
+      Input validation failed (missing required fields, type mismatch).
+
+  - code: NOT_FOUND
+    json_rpc_code: -32001
+    description: >
+      Requested document does not exist in storage.
+
+  - code: STORAGE_UNAVAILABLE
+    json_rpc_code: -32002
+    description: >
+      The document storage backend is temporarily unavailable or the
+      metadata cache has not been initialized.
+
+  - code: INTERNAL_ERROR
+    json_rpc_code: -32603
+    description: >
+      Unexpected server-side failure. Includes a request ID for
+      log correlation.
+
+# -----------------------------------------------------------------------
+# Backend Integration Pattern
+# -----------------------------------------------------------------------
+# Retrieval-domain servers typically use the "direct storage access"
+# pattern: the MCP server calls the storage API (object storage SDK,
+# document database client) directly, without an intermediate compute
+# service. This is appropriate because:
+#
+#   - Operations are simple reads (list, get) with no indexing or
+#     aggregation logic
+#   - The document corpus is small enough to cache metadata in-memory
+#   - No pagination cursor storage is needed (offset-based)
+#
+# For domains requiring full-text search, aggregation, or complex
+# queries, use the search-tool-template.yaml pattern with a dedicated
+# backend service instead.

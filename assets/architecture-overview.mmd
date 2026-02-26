@@ -1,0 +1,74 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E8F4FD', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#FFF3E0', 'secondaryBorderColor': '#FF9800', 'tertiaryColor': '#E8F5E9', 'tertiaryBorderColor': '#4CAF50', 'lineColor': '#546E7A', 'textColor': '#263238', 'fontSize': '14px'}}}%%
+
+graph TB
+    subgraph AGENT["<b>AI Agent / IDE Layer</b>"]
+        A1["Agent Framework"]
+        A2["IDE Extension<br/><i>(virtual filesystem)</i>"]
+    end
+
+    subgraph MCP["<b>MCP Server Layer</b> &nbsp; <i>(Thin Protocol Adapters)</i>"]
+        M1["Search-Domain MCP<br/>─────────────<br/>Discovery, search,<br/>retrieval, help tools"]
+        M2["Retrieval-Domain MCP<br/>─────────────<br/>List, search metadata,<br/>retrieve content tools"]
+    end
+
+    subgraph CLOUD["<b>Cloud Infrastructure</b> &nbsp; <i>(code-defined)</i>"]
+        subgraph GW["Access Control Layer"]
+            AUTH["Token Authorizer<br/><i>(external clients)</i>"]
+            UP["Usage Plans<br/>+ Client Keys"]
+        end
+        subgraph COMPUTE["Processing Layer"]
+            APIGW["API Gateway<br/><i>(cloud-native auth)</i>"]
+            FN["Serverless Function<br/><i>(compiled binary)</i><br/>─────────────<br/>Backend Search Service<br/>REST API + health checks"]
+        end
+        subgraph STORAGE["Data Layer"]
+            OBJSTORE["Object Storage<br/><i>(durable indexes)</i>"]
+            SHAREDFS["Shared Filesystem<br/><i>(hot cache)</i>"]
+            REPL["Replication Task<br/><i>(scheduled sync)</i>"]
+        end
+        subgraph FOUNDATION["Networking Layer"]
+            VNET["Virtual Network<br/>+ Private Subnets"]
+            ROLES["Execution Roles<br/><i>(least privilege)</i>"]
+            SECGRP["Security Groups<br/>/ Firewall Rules"]
+        end
+    end
+
+    subgraph BACKEND["<b>Backend Service Layer</b>"]
+        direction TB
+        DOCSTORE["Document Storage<br/><i>(object storage + local cache)</i>"]
+        SEARCH["Search Engine<br/><i>(indexing + query)</i>"]
+        KVSTORE["Key-Value Store<br/><i>(pagination cursors, TTL)</i>"]
+        DOCSTORE ~~~ SEARCH ~~~ KVSTORE
+    end
+
+    A1 -- "MCP Protocol<br/>(stdio / HTTP+SSE)" --> M1
+    A1 -- "MCP Protocol<br/>(stdio / HTTP+SSE)" --> M2
+    A2 -- "MCP Protocol<br/>(stdio)" --> M1
+
+    M1 -- "HTTP + auth" --> APIGW
+    M2 -- "Storage SDK" --> DOCSTORE
+
+    AUTH --> APIGW
+    UP --> APIGW
+    APIGW --> FN
+    FN --> SEARCH
+    FN --> KVSTORE
+    FN -- "mount" --> SHAREDFS
+    OBJSTORE -- "scheduled<br/>replication" --> REPL
+    REPL --> SHAREDFS
+
+    VNET -.-> FN
+    SECGRP -.-> SHAREDFS
+    ROLES -.-> FN
+
+    classDef agentStyle fill:#E8F4FD,stroke:#2196F3,stroke-width:2px,color:#0D47A1
+    classDef mcpStyle fill:#F3E5F5,stroke:#9C27B0,stroke-width:2px,color:#4A148C
+    classDef backendStyle fill:#FFF3E0,stroke:#FF9800,stroke-width:2px,color:#E65100
+    classDef cloudStyle fill:#E8F5E9,stroke:#4CAF50,stroke-width:2px,color:#1B5E20
+    classDef infraStyle fill:#ECEFF1,stroke:#607D8B,stroke-width:1px,color:#37474F
+
+    class A1,A2 agentStyle
+    class M1,M2 mcpStyle
+    class DOCSTORE,SEARCH,KVSTORE backendStyle
+    class APIGW,FN,AUTH,UP cloudStyle
+    class OBJSTORE,SHAREDFS,REPL cloudStyle
+    class VNET,ROLES,SECGRP infraStyle

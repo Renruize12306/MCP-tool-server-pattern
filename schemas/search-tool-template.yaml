@@ -1,0 +1,235 @@
+# MCP Tool Template: Search Domain
+#
+# Abstract template for building MCP tool contracts in the search domain.
+# A search-domain MCP server exposes indexed data (code, documents, logs,
+# metrics) to AI agents through structured query and retrieval tools.
+#
+# This template defines the tool categories and schema patterns.
+# Replace {{placeholders}} with domain-specific values.
+#
+# Protocol: Model Context Protocol (MCP)
+# Transport: stdio (local) or HTTP+SSE (cloud)
+
+server:
+  name: "{{domain}}-search-mcp"
+  version: "{{semver}}"
+  description: >
+    Provides AI agents with structured access to indexed {{domain}} data.
+    Supports full-text search, metadata listing, and content retrieval.
+
+# -----------------------------------------------------------------------
+# Tool Categories
+# -----------------------------------------------------------------------
+# Search-domain MCP servers typically expose three categories of tools:
+#
+#   1. Discovery tools  — enumerate available data sources and metadata
+#   2. Search tools     — query indexed data with filters and pagination
+#   3. Retrieval tools  — fetch specific items by identifier
+#
+# Each category follows a consistent schema pattern described below.
+
+tool_templates:
+
+  # --- Category 1: Discovery ---
+  - category: discovery
+    description: >
+      Tools that enumerate available data sources, collections, or indexes.
+      These are typically the first tools an agent invokes to understand
+      what data is available before issuing queries.
+    schema_pattern:
+      name: "list_{{resource_plural}}"
+      input_schema:
+        type: object
+        properties:
+          # Optional filters to narrow the listing
+          "{{filter_field}}":
+            type: string
+            description: "Filter by {{filter_description}}"
+        required: []
+      output_schema:
+        type: array
+        items:
+          type: object
+          properties:
+            id:
+              type: string
+              description: Unique identifier for the resource
+            name:
+              type: string
+              description: Human-readable name
+            metadata:
+              type: object
+              description: Domain-specific metadata (count, timestamp, etc.)
+    examples:
+      - name: list_indexes
+        description: "List available search indexes with repo count and freshness"
+      - name: list_collections
+        description: "List document collections with document count and last updated"
+
+  # --- Category 2: Search ---
+  - category: search
+    description: >
+      Tools that query indexed data. These accept a query string, optional
+      filters, and pagination parameters. Results are returned with context
+      (surrounding lines, relevance scores, etc.).
+    schema_pattern:
+      name: "search"
+      input_schema:
+        type: object
+        properties:
+          query:
+            type: string
+            description: "Search query (supports {{query_syntax}}: regex, keyword, etc.)"
+          source_id:
+            type: string
+            description: "Restrict search to a specific {{source_type}}"
+          filters:
+            type: object
+            description: >
+              Domain-specific filters. Common examples:
+              - file_type / language (code search)
+              - date_range (log search)
+              - severity (incident search)
+          case_sensitive:
+            type: boolean
+            default: false
+          max_results:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+          cursor:
+            type: string
+            description: Pagination cursor from a previous response
+        required: [query, source_id]
+      output_schema:
+        type: object
+        properties:
+          results:
+            type: array
+            items:
+              type: object
+              properties:
+                source:
+                  type: string
+                  description: "Which {{source_type}} this result came from"
+                location:
+                  type: string
+                  description: "Path, URI, or identifier within the source"
+                content:
+                  type: string
+                  description: Matching content with surrounding context
+                relevance:
+                  type: number
+                  description: Relevance score (higher = more relevant)
+          total_count:
+            type: integer
+            description: Total matches (may exceed returned results)
+          next_cursor:
+            type: string
+            nullable: true
+            description: Cursor for the next page (null if no more results)
+    pagination_note: >
+      Cursor-based pagination is recommended for search results. Cursors
+      should be opaque tokens backed by a key-value store with TTL, so
+      they expire automatically and do not require client-side cleanup.
+
+  # --- Category 3: Retrieval ---
+  - category: retrieval
+    description: >
+      Tools that fetch a specific item by identifier. These return the
+      full content of a single resource (file, document, record).
+    schema_pattern:
+      name: "get_{{resource}}"
+      input_schema:
+        type: object
+        properties:
+          resource_id:
+            type: string
+            description: "Unique identifier of the {{resource}} to retrieve"
+          slice:
+            type: object
+            description: >
+              Optional content slicing (e.g., line range for code,
+              page range for documents, time window for logs)
+            properties:
+              start:
+                type: integer
+              end:
+                type: integer
+        required: [resource_id]
+      output_schema:
+        type: object
+        properties:
+          content:
+            type: string
+            description: "Full or sliced content of the {{resource}}"
+          metadata:
+            type: object
+            description: Resource metadata (size, type, timestamps, etc.)
+          truncated:
+            type: boolean
+            description: Whether content was truncated due to size limits
+
+  # --- Optional: Help / Syntax Reference ---
+  - category: help
+    description: >
+      A static tool that returns query syntax documentation.
+      Useful for agents that need to construct queries programmatically.
+    schema_pattern:
+      name: "query_help"
+      input_schema:
+        type: object
+        properties: {}
+        required: []
+      output_schema:
+        type: object
+        properties:
+          syntax_guide:
+            type: string
+            description: Markdown-formatted query syntax reference
+          examples:
+            type: array
+            items:
+              type: object
+              properties:
+                query:
+                  type: string
+                description:
+                  type: string
+
+# -----------------------------------------------------------------------
+# Error Schema
+# -----------------------------------------------------------------------
+# All tools return MCP-standard error responses on failure.
+# Error codes follow JSON-RPC 2.0 conventions.
+
+error_schemas:
+  - code: INVALID_PARAMS
+    json_rpc_code: -32602
+    description: >
+      Input validation failed (missing required fields, type mismatch,
+      out-of-range values).
+
+  - code: NOT_FOUND
+    json_rpc_code: -32001
+    description: >
+      Requested resource (index, collection, file, document) does not exist.
+
+  - code: BACKEND_UNAVAILABLE
+    json_rpc_code: -32002
+    description: >
+      The backend service is temporarily unavailable (e.g., index loading,
+      storage timeout).
+
+  - code: CURSOR_EXPIRED
+    json_rpc_code: -32003
+    description: >
+      A pagination cursor has expired. The client should re-issue the
+      original query without a cursor.
+
+  - code: INTERNAL_ERROR
+    json_rpc_code: -32603
+    description: >
+      Unexpected server-side failure. Includes a request ID for log
+      correlation.
