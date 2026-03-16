@@ -1,162 +1,161 @@
 # Architecture
 
-This document describes the component architecture, data flow, and deployment modes of the MCP Tool Access Pattern. For the engineering rationale behind these choices, see [Design Principles](design-principles.md).
+This document describes the MCP tool server architecture — how to wrap an existing backend service (e.g., a code search engine, a document store) as a standardized MCP tool server that agents can invoke. For the engineering rationale behind these choices, see [Design Principles](design-principles.md).
+
+## The Problem
+
+You have a backend service with a REST API — a code search engine, a log query service, a document store. You want AI agents to use it. But agents can't call arbitrary REST APIs directly. They need:
+
+1. **Typed tool contracts** — structured input schemas, output schemas, and descriptions that the agent framework can discover and validate
+2. **Pagination** — search results can be large; the server must manage pagination state so agents can iterate through results without blowing up context windows
+3. **Error handling** — backend HTTP errors must be translated into structured MCP error codes that agents can reason about
+4. **Dual-mode transport** — developers test locally (stdio, no auth); production runs in the cloud (HTTP+SSE, with auth). The tool logic must be identical in both.
+
+The MCP tool server solves this by acting as a **thin protocol adapter** between agents and your backend.
 
 ## System Overview
 
-The system bridges AI agent frameworks and organizational backend services through the Model Context Protocol (MCP). It consists of four layers:
-
-1. **MCP Server Layer** — Thin protocol adapters exposing backend services as agent-accessible tools
-2. **Backend Service Layer** — High-performance services implementing search, retrieval, and data access
-3. **Cloud Infrastructure Layer** — Serverless compute, managed storage, and networking (code-defined)
-4. **Developer Integration Layer** — IDE extensions and local development tooling
+The MCP server layer bridges AI agents and backend services through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). A single MCP server acts as a thin protocol adapter that translates agent tool calls into backend REST API requests. It handles protocol-level concerns only (input validation, response formatting, error mapping, pagination) while all business logic resides in the backend.
 
 ## Technology Mapping
 
-Throughout this document, architectural roles are described generically. The table below lists common technology options for each role. Any combination that satisfies the role requirements can be used.
+Throughout this document, architectural roles are described generically. The table below lists common technology options for the **server-side** components.
 
 | Architectural Role | Examples |
 |-------------------|----------|
-| MCP framework | FastMCP (Python), mcp-python-sdk, custom implementation |
-| Search engine | Zoekt, Elasticsearch, Sourcegraph, Ripgrep |
-| Backend language | Go, Rust, Java, C++ (compiled binary recommended for cold starts) |
-| Serverless compute | AWS Lambda, Google Cloud Functions, Cloud Run, Azure Functions |
-| API gateway | AWS API Gateway, Google Cloud Endpoints, Azure API Management, Kong, Envoy |
-| Object storage | AWS S3, Google Cloud Storage, Azure Blob Storage, MinIO |
-| Shared filesystem | AWS EFS, Google Filestore, Azure Files, NFS |
-| Key-value store (cursors) | DynamoDB, Redis, Firestore, Memcached (TTL support required) |
-| Data replication | AWS DataSync, rsync, Google Storage Transfer Service |
-| Infrastructure framework | CDK, Terraform, Pulumi, CloudFormation |
-| Cloud-native auth | Cloud-native request signing (e.g., SigV4), JWT, mTLS, API keys |
-| IDE integration | VS Code Extension API, JetBrains plugin SDK, Neovim plugin |
-| Agent framework | Strands Agents SDK, LangChain, AutoGen, custom |
+| MCP framework | FastMCP (Python), mcp-python-sdk, mcp-typescript-sdk, custom implementation |
+| Backend: search engine | Zoekt (trigram-indexed), Elasticsearch, Sourcegraph, OpenSearch |
+| Backend: document store | S3 + metadata DB, Azure Blob + Cosmos DB, PostgreSQL, DynamoDB |
+| Pagination state | DynamoDB (TTL), Redis, Cosmos DB Table API, in-memory (local mode) |
+| IDE integration (client-side) | VS Code Extension API, JetBrains plugin SDK, Neovim plugin |
 
-## Component Breakdown
+## MCP Server Internal Layers
 
-### 1. MCP Servers
+The MCP server is structured as three internal layers, each with a single responsibility:
 
-Thin protocol wrappers built with an MCP framework that translate MCP tool calls into backend service requests. Each server is stateless and handles protocol-level concerns only (input validation, response formatting, error mapping).
+### Layer 1: Tool Layer
 
-MCP servers in this pattern fall into two categories, each with a distinct backend integration style:
+The outermost layer facing the agent. It defines typed tool contracts (search, list, get, help), validates input parameters against schemas, and manages pagination cursors. Each tool category has its own schema (see [`schemas/`](../schemas/) for templates).
 
-**Search-domain servers** expose tools for querying indexed data (code, logs, metrics). These forward requests to a dedicated backend compute service through an API gateway. Tools follow the discovery → search → retrieval pattern described in [`schemas/search-tool-template.yaml`](../schemas/search-tool-template.yaml).
+**Key responsibilities**:
+- Parse and validate tool call inputs against the schema
+- Reject malformed inputs before they reach the backend
+- Manage pagination: create cursors, validate cursor tokens, handle expired cursors
+- Enforce max_results limits and content slicing parameters
 
-**Retrieval-domain servers** expose tools for accessing document stores (runbooks, wikis, policies). These access object storage directly via SDK calls, without an intermediate compute layer. Tools follow the list → search metadata → retrieve pattern described in [`schemas/retrieval-tool-template.yaml`](../schemas/retrieval-tool-template.yaml).
+### Layer 2: Request Translation
 
-**Dual-mode operation**: Each server supports two transport modes:
+The middle layer that converts MCP tool calls into HTTP requests targeting the backend REST API, and converts HTTP responses back into MCP tool results. This layer is responsible for serialization, header construction, and endpoint routing.
 
-| Mode | Transport | Auth | Use Case |
-|------|-----------|------|----------|
-| **Local (stdio)** | stdin/stdout JSON-RPC | None (local trust) | Development, IDE integration, testing |
-| **Cloud (HTTP)** | HTTP + Server-Sent Events | Cloud-native auth at API gateway | Production multi-tenant deployment |
+**Key responsibilities**:
+- Map tool name + parameters → HTTP method + URL + body
+- Attach authentication headers (cloud mode only)
+- Map HTTP response body → MCP tool result format
+- Handle response pagination metadata (next_cursor, total_count)
+
+### Layer 3: Error Handling
+
+The innermost layer before the network boundary. It maps backend HTTP errors and transport failures into structured MCP error codes (JSON-RPC 2.0), attaches request IDs for log correlation, and ensures every failure path produces an observable, structured response.
+
+**Key responsibilities**:
+- Map HTTP 4xx/5xx → specific MCP error codes (NOT_FOUND, BACKEND_UNAVAILABLE, etc.)
+- Attach request IDs for cross-system log correlation
+- Handle transport failures (timeout, connection refused) as structured errors
+- Never leak raw backend error details to the agent
+
+## Dual-Mode Transport
+
+The MCP server supports two transport modes with **identical tool logic**:
+
+| Mode | Transport | Agent → Server Auth | Server → Backend Auth | Use Case |
+|------|-----------|-------------------|---------------------|----------|
+| **Local (stdio)** | stdin/stdout JSON-RPC | None (local trust) | None (localhost) | Development, IDE integration, testing |
+| **Cloud (HTTP)** | HTTP + Server-Sent Events | OAuth2 at gateway | Cloud-native auth | Production, multi-tenant agents |
 
 Mode selection is determined at startup via configuration; the tool logic is identical in both modes.
 
-### 2. Backend Search Service
+### Multi-Cloud Auth Mapping
 
-A high-performance REST API wrapping a code search engine. This service handles compute-intensive search operations and provides cursor-based pagination for large result sets.
+In cloud mode, two authentication layers are needed. The specific mechanism depends on the cloud provider:
 
-The service compiles to a single binary with **dual entry points**: a standalone HTTP server for local development, and a serverless function handler for production. In cloud mode, the serverless function executes the binary directly — the "search service" is not a separate process but the application logic running inside the function.
+| Auth Layer | Purpose | AWS | Azure |
+|-----------|---------|-----|-------|
+| Agent → Gateway (Layer 1) | Authenticate external agents | API Gateway + Cognito (OAuth2 JWT) | API Management + Entra ID (OAuth2) |
+| Server → Backend (Layer 2) | Authenticate MCP server to backend API | IAM Auth (SigV4 request signing) | Managed Identity |
+| Credential management | Rotate/revoke outbound credentials | Secrets Manager | Key Vault |
 
-> See [`schemas/backend-api-template.yaml`](../schemas/backend-api-template.yaml) for the endpoint template.
+> For the full cloud deployment architecture (containerization, serverless compute, infrastructure templates), see the companion project [MCP-tool-deployment-pattern](../../MCP-tool-deployment-pattern/).
 
-**Key design decisions**:
+## Tool Categories
 
-- **Cursor-based pagination** (key-value store with TTL) rather than offset-based, to support stable iteration over changing index data
-- **Dual entry points**: Standalone HTTP server for local development; serverless function handler for production (same binary, different entrypoint)
-- **Shared filesystem for indexes**: Search indexes are large binary files; a shared filesystem provides low-latency access across function invocations without cold-start re-download
-- **Structured logging + metrics**: Operational observability built in from the start
+The single MCP server exposes multiple tool categories, each addressing a different data access pattern:
 
-### 3. Cloud Infrastructure
+### Search-Domain Tools
 
-Multi-layer deployment organized by resource lifecycle:
+Tools for querying indexed data (code, logs, metrics). These follow the **discovery → search → retrieval** pattern described in [`schemas/search-tool-template.yaml`](../schemas/search-tool-template.yaml).
 
-| Layer | Resources | Rationale |
-|-------|-----------|-----------|
-| **Networking** | Virtual network, subnets, NAT gateway, execution roles, security groups / firewall rules | Shared networking; changes rarely |
-| **Data** | Object storage (durable index), shared filesystem (hot cache), replication task | Data plane; independent scaling |
-| **Processing** | Serverless function (compiled binary), API gateway (authenticated) | Request plane; scales to zero |
-| **Access Control** | Token-based authorizer, usage plans, client keys | Access control for external agent platforms |
+**Pagination**: Cursor-based, backed by a key-value store with TTL. Cursors are opaque server-side tokens that expire automatically.
 
-**Data flow**: Search indexes are built offline and uploaded to object storage. A replication task syncs them to the shared filesystem. The serverless function reads indexes from the shared filesystem at invocation time (no cold-start download).
+**Example backend**: Zoekt code search engine — the MCP server wraps Zoekt's REST API, adding typed tool contracts, input validation, cursor-based pagination, and structured error codes.
 
-> See [`schemas/infrastructure-layer-template.yaml`](../schemas/infrastructure-layer-template.yaml) for layer definitions and [`templates/infrastructure-config-template.yaml`](../templates/infrastructure-config-template.yaml) for a configuration skeleton.
+### Retrieval-Domain Tools
 
-### 4. Developer Integration
+Tools for accessing document stores (runbooks, wikis, policies). These follow the **list → search metadata → retrieve** pattern described in [`schemas/retrieval-tool-template.yaml`](../schemas/retrieval-tool-template.yaml).
 
-IDE extension providing:
+**Pagination**: Offset-based (stateless), appropriate when the document corpus is small and changes infrequently.
 
-- **Search UI**: Webview-based interface for interactive search
-- **Virtual file system**: Custom URI scheme for browsing indexed codebases directly in the editor without cloning repositories
-- **MCP client integration**: Connects to local MCP server (stdio mode) for agent-assisted search within the IDE
+### Choosing a Tool Category
 
-## Data Flow
-
-The system has two distinct data paths depending on the type of MCP server being invoked:
-
-### Search Path (compute-backed)
-
-Used by search-domain MCP servers that require a backend compute service for query execution.
-
-```
-[Agent issues MCP tool call (e.g., search, get_file)]
-         │
-         ▼
-[MCP Server: validate input, translate to HTTP request]
-         │
-         ▼
-[API Gateway: authenticate, rate limit, route]
-         │
-         ▼
-[Serverless function: read index from shared filesystem, execute search, paginate via key-value store]
-         │
-         ▼
-[MCP Server: format response as MCP tool result]
-         │
-         ▼
-[Agent receives structured result]
-```
-
-Pagination: **Cursor-based** (key-value store with TTL). Cursors are opaque tokens that enable stable iteration even when the underlying index changes between pages.
-
-### Retrieval Path (direct storage access)
-
-Used by retrieval-domain MCP servers that access document storage directly.
-
-```
-[Agent issues MCP tool call (e.g., list_documents, get_document)]
-         │
-         ▼
-[MCP Server: validate input, query object storage directly via SDK]
-         │
-         ▼
-[Object storage: return listing or content]
-         │
-         ▼
-[MCP Server: parse metadata / format content, return MCP tool result]
-         │
-         ▼
-[Agent receives structured result]
-```
-
-Pagination: **Offset-based** (in-memory). Document metadata is cached locally in the MCP server. This simpler approach is appropriate when the document corpus is small (hundreds to low thousands) and changes infrequently.
-
-> **Note**: The retrieval path bypasses the API gateway and serverless function entirely — the MCP server communicates with object storage directly. This avoids unnecessary latency for simple read operations.
-
-### When to Use Which Path
-
-| Factor | Search Path | Retrieval Path |
-|--------|------------|----------------|
+| Factor | Search-Domain Tools | Retrieval-Domain Tools |
+|--------|-------------------|----------------------|
 | Data volume | Large (millions of files/records) | Small (hundreds to thousands of documents) |
 | Query complexity | Full-text search, regex, filtering | Keyword matching, metadata filtering |
 | Compute needs | Indexing engine, ranked results | Simple reads, no indexing |
-| Pagination | Cursor-based (server-side state) | Offset-based (stateless) |
-| Backend dependency | Dedicated compute service required | Object storage SDK only |
+| Pagination | Cursor-based (server-side state, TTL) | Offset-based (stateless) |
+| Example backends | Zoekt, Elasticsearch, OpenSearch | S3 + metadata, document DBs, wikis |
+
+## Data Flow
+
+All tool calls — regardless of category — follow a single data path:
+
+```
+[Agent issues MCP tool call (e.g., search, list_documents, get_file)]
+         |
+         v
+[Tool Layer: validate input against schema, check pagination cursor]
+         |
+         v
+[Request Translation: convert tool call → HTTP request + auth headers]
+         |
+         v
+[Error Handling: attach request ID, wrap outbound request]
+         |
+         v
+[Backend REST API: authenticate, route, execute (search/retrieval)]
+         |
+         v
+[Error Handling: map HTTP status → MCP error code, attach request ID]
+         |
+         v
+[Request Translation: convert HTTP response → MCP tool result]
+         |
+         v
+[Tool Layer: attach pagination cursor if applicable]
+         |
+         v
+[Agent receives structured result with typed output]
+```
+
+**Pagination flow**:
+- **Cursor-based** (search): First call → backend creates cursor in key-value store (TTL=15min) → returns results + `next_cursor`. Next call with `cursor` → backend looks up state → returns next page. Cursor expires after TTL.
+- **Offset-based** (retrieval): Each call includes `offset` and `limit`. Stateless — no server-side state needed.
 
 ## Deployment Modes
 
 | Mode | Components Running | Storage | Auth | Typical Use |
 |------|-------------------|---------|------|-------------|
-| **Local development** | MCP server (stdio) + search service (HTTP) | Local filesystem | None | Individual developer, testing |
-| **Cloud production** | MCP server (HTTP/SSE) + API gateway + serverless function | Object storage + shared filesystem + key-value store | Cloud-native auth / OAuth2 | Multi-tenant, production agents |
-| **Hybrid** | MCP server (stdio, local) → API gateway (cloud) | Cloud storage | Cloud-native auth | IDE extension accessing cloud indexes |
+| **Local** | MCP server (stdio) + backend (HTTP on localhost) | Local filesystem | None | Developer testing, IDE integration |
+| **Cloud** | MCP server (HTTP/SSE) + API gateway + serverless backend | Object storage + shared filesystem + key-value store | Two-layer: OAuth2 (gateway) + cloud-native (backend) | Multi-tenant production |
+| **Hybrid** | MCP server (stdio, local) → API gateway (cloud) | Cloud storage | Cloud-native auth (Layer 2 only) | IDE extension accessing cloud indexes |
+
+> For the full cloud deployment reference (containerization, networking, operational checklists, multi-cloud mapping), see [MCP-tool-deployment-pattern](../../MCP-tool-deployment-pattern/).

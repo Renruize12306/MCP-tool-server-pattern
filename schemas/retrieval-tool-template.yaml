@@ -1,14 +1,15 @@
 # MCP Tool Template: Knowledge Retrieval Domain
 #
 # Abstract template for building MCP tool contracts in the knowledge
-# retrieval domain. A retrieval-domain MCP server provides agents with
-# access to document stores — runbooks, wikis, policies, configuration
-# files, or any corpus of semi-structured text.
+# retrieval domain. Retrieval-domain tools within the MCP server provide
+# agents with access to document stores — runbooks, wikis, policies,
+# configuration files, or any corpus of semi-structured text.
 #
-# Unlike search-domain servers (which query indexed data through a
-# backend compute service), retrieval servers typically access object
-# storage or document APIs directly, since the operations are simple
-# reads without compute-intensive indexing.
+# Unlike search-domain tools (which query indexed data with full-text
+# search and cursor-based pagination), retrieval-domain tools are
+# optimized for simpler read patterns: listing, keyword metadata search,
+# and fetching individual documents. All tool calls follow the same
+# data flow through the MCP server to the backend REST API.
 #
 # Replace {{placeholders}} with domain-specific values.
 #
@@ -26,7 +27,7 @@ server:
 # -----------------------------------------------------------------------
 # Tool Categories
 # -----------------------------------------------------------------------
-# Retrieval-domain MCP servers typically expose three tools:
+# Retrieval-domain tools within the MCP server typically include:
 #
 #   1. List      — enumerate available documents with metadata
 #   2. Search    — keyword-based search over document metadata
@@ -83,7 +84,7 @@ tool_templates:
               items:
                 type: string
     pagination_note: >
-      Offset-based pagination is acceptable for retrieval-domain servers
+      Offset-based pagination is acceptable for retrieval-domain tools
       where the document corpus is small (hundreds to low thousands) and
       changes infrequently. For larger or rapidly changing corpora, use
       cursor-based pagination instead (see search-tool-template.yaml).
@@ -92,8 +93,9 @@ tool_templates:
   - category: metadata_search
     description: >
       Keyword-based search over document metadata (titles, tags,
-      classifications). This is a lightweight operation performed
-      against a cached metadata index — not a full-text search.
+      classifications). This is a lightweight operation — not a
+      full-text search — suitable for finding documents by known
+      attributes.
     schema_pattern:
       name: "search_{{document}}_metadata"
       input_schema:
@@ -174,11 +176,11 @@ error_schemas:
     description: >
       Requested document does not exist in storage.
 
-  - code: STORAGE_UNAVAILABLE
+  - code: BACKEND_UNAVAILABLE
     json_rpc_code: -32002
     description: >
-      The document storage backend is temporarily unavailable or the
-      metadata cache has not been initialized.
+      The backend REST API or its underlying document storage is
+      temporarily unavailable.
 
   - code: INTERNAL_ERROR
     json_rpc_code: -32603
@@ -187,18 +189,14 @@ error_schemas:
       log correlation.
 
 # -----------------------------------------------------------------------
-# Backend Integration Pattern
+# Backend Integration
 # -----------------------------------------------------------------------
-# Retrieval-domain servers typically use the "direct storage access"
-# pattern: the MCP server calls the storage API (object storage SDK,
-# document database client) directly, without an intermediate compute
-# service. This is appropriate because:
+# Retrieval-domain tools follow the same data flow as all other tools
+# in the MCP server: tool calls are translated into HTTP requests to
+# the backend REST API. The backend handles document storage access
+# (object storage, document databases, etc.) and returns results via
+# HTTP. This unified path ensures consistent authentication, rate
+# limiting, and observability across all tool categories.
 #
-#   - Operations are simple reads (list, get) with no indexing or
-#     aggregation logic
-#   - The document corpus is small enough to cache metadata in-memory
-#   - No pagination cursor storage is needed (offset-based)
-#
-# For domains requiring full-text search, aggregation, or complex
-# queries, use the search-tool-template.yaml pattern with a dedicated
-# backend service instead.
+# For domains requiring full-text search, indexing, or ranked results,
+# use the search-tool-template.yaml pattern instead.

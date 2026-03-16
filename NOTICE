@@ -1,4 +1,4 @@
-MCP Tool Access Pattern
+MCP Server Patterns
 Copyright 2025, Ruize Ren
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -7,13 +7,12 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-This repository contains generalized architectural patterns, tool contracts,
-and operational templates informed by experience in industrial cloud
-environments. All employer-specific system names, internal URLs,
-proprietary configurations, and sensitive operational data have been removed
-or replaced with synthetic equivalents.
+This repository contains generalized design patterns and tool contract
+templates informed by experience in industrial environments. All
+employer-specific system names, internal URLs, proprietary configurations,
+and sensitive operational data have been removed or replaced with
+synthetic equivalents.
 
-The patterns, schemas, templates, and checklists in this repository are
-applicable to any organization deploying MCP-based agent tooling on cloud
-infrastructure and are published as public technical artifacts for
-independent review.
+The patterns and schemas in this repository are applicable to any
+organization building MCP servers and are published as public technical
+artifacts for independent review.

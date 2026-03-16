@@ -1,8 +1,9 @@
 # MCP Tool Template: Search Domain
 #
 # Abstract template for building MCP tool contracts in the search domain.
-# A search-domain MCP server exposes indexed data (code, documents, logs,
-# metrics) to AI agents through structured query and retrieval tools.
+# Search-domain tools within the MCP server expose indexed data (code,
+# documents, logs, metrics) to AI agents through structured query and
+# retrieval tools.
 #
 # This template defines the tool categories and schema patterns.
 # Replace {{placeholders}} with domain-specific values.
@@ -20,7 +21,7 @@ server:
 # -----------------------------------------------------------------------
 # Tool Categories
 # -----------------------------------------------------------------------
-# Search-domain MCP servers typically expose three categories of tools:
+# Search-domain tools within the MCP server typically fall into three categories:
 #
 #   1. Discovery tools  — enumerate available data sources and metadata
 #   2. Search tools     — query indexed data with filters and pagination

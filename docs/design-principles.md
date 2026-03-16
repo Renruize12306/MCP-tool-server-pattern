@@ -1,98 +1,117 @@
 # Design Principles
 
-This document captures the engineering rationale and trade-off analysis behind the MCP Tool Access Pattern. For the concrete component breakdown and deployment details, see [Architecture](architecture.md).
+This document captures the engineering rationale and trade-off analysis behind the MCP tool server design patterns. For the concrete component breakdown and data flow details, see [Architecture](architecture.md).
 
 ## Core Principles
 
-### 1. Protocol-First: MCP as the Standard Interface
+### 1. Thin MCP Server: Protocol Adapter Only
 
-**Decision**: Use MCP as the sole interface between AI agents and backend services. No custom agent-tool bindings.
-
-**Rationale**: Agent frameworks evolve rapidly; backend services are long-lived. By placing MCP as the contract boundary, we decouple agent evolution from service evolution. A new agent framework (or a new version of an existing one) can access existing tools without backend changes, as long as it speaks MCP.
-
-**Trade-off**: MCP adds a serialization layer compared to direct function calls. In practice, the overhead is negligible relative to network latency and LLM inference time.
-
-### 2. Separation of Concerns: Thin MCP Servers
-
-**Decision**: MCP servers are thin translation layers only. They handle input validation, protocol formatting, and error mapping. All business logic lives in backend services.
+**Decision**: The MCP server is a thin translation layer. It handles input validation, protocol formatting, pagination, and error mapping. All business logic lives in the backend service.
 
 **Rationale**:
 - **Testability**: Backend services can be tested independently of the MCP protocol
-- **Reusability**: The same backend service can serve MCP clients, REST clients, and CLI tools
+- **Reusability**: The same backend can serve MCP clients, REST clients, CLI tools, and IDE extensions
 - **Operational simplicity**: MCP servers are stateless and lightweight; complex state management stays in the backend
+- **Upgradeability**: MCP protocol evolves independently from backend logic — upgrading one doesn't break the other
 
-**Anti-pattern avoided**: "Fat MCP servers" that embed search logic, caching, and data transformation. These become hard to test, hard to scale, and tightly coupled to the agent framework.
+**Anti-pattern avoided**: "Fat MCP servers" that embed search logic, caching, and data transformation. These become hard to test, hard to scale, and tightly coupled to the MCP framework.
 
-### 3. Cloud-Native by Default
+### 2. Dual-Mode Transport
 
-**Decision**: Design for serverless compute, managed storage, and infrastructure as code from the start.
-
-**Rationale**:
-- **Scale-to-zero**: Agent tool access is bursty — high during incidents, near-zero otherwise. Serverless avoids paying for idle capacity.
-- **Operational overhead**: Managed services eliminate patching, capacity planning, and failover configuration for storage and compute.
-- **Reproducibility**: Code-defined infrastructure stacks make the entire deployment version-controlled and reproducible across environments.
-
-**Trade-off**: Cold start latency on serverless functions. Mitigated by:
-- Compiled-language runtimes (fast cold starts, ~200ms)
-- Shared filesystem for indexes (no download on cold start)
-- Provisioned concurrency for latency-sensitive deployments
-
-### 4. Dual-Mode Deployment
-
-**Decision**: Every MCP server runs in two modes — local (stdio) for development and cloud (HTTP) for production — with identical tool logic.
+**Decision**: Every MCP server runs in two modes — local (stdio) for development and cloud (HTTP+SSE) for production — with identical tool logic.
 
 **Rationale**:
-- **Developer experience**: Engineers can test tool interactions locally without deploying infrastructure
-- **Parity**: The same tool contract is exercised in both modes, reducing integration surprises
-- **IDE integration**: Local stdio mode enables direct integration with editors and development tools
+- **Developer experience**: Engineers can test tool interactions locally without deploying infrastructure or configuring auth
+- **Parity**: The same tool contract is exercised in both modes, reducing "works locally, breaks in production" surprises
+- **IDE integration**: Local stdio mode enables direct integration with editors (VS Code, JetBrains, Neovim)
 
 **Implementation**: Mode selection is a startup configuration flag. The tool handler functions are shared; only the transport adapter differs.
 
-### 5. Authentication at the Edge
+**Auth difference by mode**:
 
-**Decision**: All authentication and authorization happens at the API gateway layer (cloud-native auth for internal clients, OAuth2 for external agent platforms). MCP servers and backend services trust the authenticated identity passed through.
+| Mode | Agent → Server | Server → Backend |
+|------|---------------|-----------------|
+| Local (stdio) | None (local trust) | None (localhost) |
+| Cloud (HTTP) | OAuth2 at gateway | Cloud-native auth (AWS: SigV4 / Azure: Managed Identity) |
+
+### 3. Cursor-Based Pagination for Search
+
+**Decision**: Search-domain tools use cursor-based pagination with server-side state (key-value store + TTL), not offset-based pagination.
 
 **Rationale**:
-- **Single enforcement point**: Authentication logic is not duplicated across services
-- **Least privilege**: Gateway policies enforce per-client rate limits and resource access
-- **Local bypass**: In development mode (stdio), no auth is needed — the local user is implicitly trusted
+- **Stability**: Offset-based pagination breaks when the underlying index changes between pages (results shift, duplicates appear). Cursors capture a snapshot of the query state.
+- **Agent-friendly**: Agents don't need to track page numbers or compute offsets. They just pass `next_cursor` from the previous response. This is simpler for LLM-generated tool calls.
+- **Automatic cleanup**: Cursors expire via TTL (e.g., 15 minutes), so no garbage collection or client-side cleanup is needed.
+- **Context window safety**: `max_results` per page is bounded (default 50, max 200), preventing a single tool call from returning megabytes of data.
 
-**Trade-off**: Requires a well-configured API gateway; misconfiguration at the edge exposes the entire backend. Mitigated by security audit checklists (see [`templates/security-audit-checklist.md`](../templates/security-audit-checklist.md)).
+**Trade-off**: Server-side cursor state requires a key-value store. Mitigated by:
+- Using managed services with TTL (DynamoDB, Cosmos DB Table API, Redis)
+- Cursors are small (query hash + offset pointer) — minimal storage cost
+- In local mode, cursors can be stored in-memory
+
+**When to use offset-based instead**: For retrieval-domain tools where the document corpus is small (hundreds to low thousands), changes infrequently, and query volume is low. See `schemas/retrieval-tool-template.yaml`.
+
+### 4. Structured Error Handling with Request IDs
+
+**Decision**: Every error path produces a structured MCP error response with a JSON-RPC 2.0 error code and a unique request ID. No raw HTTP errors are forwarded to agents.
+
+**Rationale**:
+- **Agent reasoning**: Agents can branch on structured error codes (e.g., retry on `BACKEND_UNAVAILABLE`, re-query on `CURSOR_EXPIRED`, stop on `NOT_FOUND`). Raw HTTP status codes are ambiguous.
+- **Observability**: Request IDs enable cross-system log correlation (agent → MCP server → backend). When an investigation involves "why did the agent get this result?", the request ID traces the full path.
+- **Security**: Raw backend errors may leak internal details (stack traces, internal URLs). Error mapping ensures only safe, structured information reaches the agent.
+
+**Error code mapping**:
+
+| Backend Condition | MCP Error Code | JSON-RPC Code | Agent Action |
+|------------------|---------------|---------------|-------------|
+| HTTP 400 / validation failure | `INVALID_PARAMS` | -32602 | Fix input and retry |
+| HTTP 404 / resource not found | `NOT_FOUND` | -32001 | Try different resource |
+| HTTP 503 / backend down | `BACKEND_UNAVAILABLE` | -32002 | Wait and retry |
+| Cursor expired | `CURSOR_EXPIRED` | -32003 | Re-issue query without cursor |
+| Unexpected failure | `INTERNAL_ERROR` | -32603 | Report to operator |
+
+### 5. Content Slicing for Large Results
+
+**Decision**: Retrieval tools support content slicing (line ranges, byte ranges, page ranges) to prevent returning entire large files in a single response.
+
+**Rationale**:
+- **Context window limits**: LLM context windows are finite. A single `get_file` call that returns a 10,000-line file will blow past the limit.
+- **Agent efficiency**: Agents typically need a specific section of a file (e.g., lines 100-150 around a search match), not the whole thing.
+- **Network efficiency**: Smaller payloads reduce latency and cost.
+
+**Implementation**: `slice` parameter in retrieval tools with `start` and `end` fields. The `truncated` boolean in the response tells the agent whether more content exists.
 
 ## Key Engineering Trade-Offs
 
-The table below captures trade-off decisions that arise when implementing this pattern. The "reference choice" column reflects one validated set of decisions; alternatives may be preferable depending on organizational constraints.
-
 | Decision Area | Reference Choice | Alternatives Considered | Rationale |
 |--------------|-----------------|------------------------|-----------|
-| Search engine | Purpose-built code search library | General-purpose search service, hosted search API | A library embedded in the function binary has a smaller operational footprint and avoids a network hop |
-| Index storage | Shared filesystem (hot cache) | Direct object storage reads, block volumes | Shared filesystem provides concurrent access across function invocations without cold-start downloads |
-| Pagination state | Key-value store with TTL | Cache service, in-memory | TTL provides automatic cursor cleanup with no additional infrastructure |
-| Infrastructure framework | Type-safe, code-defined (same language as IDE extension) | Declarative config (HCL, YAML) | Type-safe constructs catch errors at compile time; language sharing reduces context-switching |
-| MCP framework | Existing open-source MCP library | Custom implementation | A library handles protocol boilerplate; focus development effort on tool logic |
-| Backend language | Compiled language with fast cold starts | Interpreted language, systems language | Fast cold starts are critical for serverless; single-binary deployment simplifies packaging |
+| Server thickness | Thin (protocol adapter only) | Fat (embed search logic) | Thin servers are testable, reusable, and independently deployable |
+| Search pagination | Cursor-based (server-side state) | Offset-based (stateless) | Cursors are stable under index changes and agent-friendly |
+| Retrieval pagination | Offset-based (stateless) | Cursor-based | Small corpus, infrequent changes — simplicity wins |
+| Error mapping | Structured MCP codes + request ID | Forward raw HTTP errors | Agents need structured codes; raw errors leak internals |
+| Transport | Dual-mode (stdio + HTTP) | HTTP only | Local stdio enables IDE integration and zero-config testing |
+| MCP framework | Existing open-source library | Custom implementation | Library handles protocol boilerplate; focus on tool logic |
+| Backend coupling | REST API boundary | Direct function calls | REST boundary enables independent deployment and testing |
+| Content delivery | Sliced retrieval with truncation flag | Full content always | Protects agent context windows; reduces payload size |
 
-## Extensibility: Adding New MCP Servers
+## Extensibility: Adding New Tool Categories
 
-The pattern is designed so that new data sources can be integrated by adding MCP servers without modifying existing components. The process follows a consistent template:
+The pattern is designed so that new data sources can be integrated by adding tool categories to the MCP server without modifying existing tools or the backend integration path:
 
-1. **Define the tool contract** — Create a new YAML schema (see `schemas/` for templates) specifying each tool's name, description, input schema, and output schema. Use `search-tool-template.yaml` for indexed/queryable data or `retrieval-tool-template.yaml` for document stores.
+1. **Define the tool contract** — Create a new YAML schema (see `schemas/` for templates). Use `search-tool-template.yaml` for indexed/queryable data or `retrieval-tool-template.yaml` for document stores.
 
-2. **Implement a thin MCP server** — Build a server using an MCP framework that translates tool calls into backend requests. Follow the Separation of Concerns principle: the MCP server handles protocol concerns only (validation, formatting, error mapping). All business logic belongs in the backend.
+2. **Implement tool handlers** — Add handlers to the Tool Layer. Each follows the same three-layer flow: Tool Layer (validation) → Request Translation (MCP-to-HTTP) → Error Handling (structured codes).
 
-3. **Choose the backend integration pattern**:
-   - **Direct storage access**: Suitable when the data source is a managed service with an SDK and operations are simple reads. The MCP server calls the storage API directly.
-   - **Dedicated backend service**: Suitable when the operation requires custom compute logic, indexing, or stateful pagination. Deploy the service using the existing infrastructure stack pattern.
+3. **Extend the backend REST API** — Add API endpoints for the new tool category. All tools go through HTTP + auth to the backend, ensuring consistent authentication and rate limiting.
 
-4. **Wire authentication** — If the new server uses cloud mode (HTTP), route it through the existing API gateway for consistent authentication. If it only needs local mode (stdio), no auth changes are required.
+4. **Wire authentication** — In cloud mode, new tools automatically inherit the existing gateway auth (Layer 1: OAuth2) and backend auth (Layer 2: cloud-native). In local mode, no auth changes needed.
 
-5. **Add operational checklists** — Extend the deployment and security checklists to cover the new server's specific concerns (storage permissions, rate limits, data sensitivity).
-
-**When to use which pattern**: Choose direct storage access when the operation is a simple read/write against a managed service. Choose a dedicated backend service when the operation involves indexing, search, aggregation, or custom business logic. See the "When to Use Which Path" table in [Architecture](architecture.md) for a detailed comparison.
+5. **Add operational checklists** — Extend deployment and security checklists to cover the new tool category's concerns (see [MCP-tool-deployment-pattern](../../MCP-tool-deployment-pattern/)).
 
 ## Failure Handling Philosophy
 
-1. **Fail fast at the protocol boundary**: MCP servers validate inputs and return structured errors before making backend calls
-2. **Retry at the infrastructure layer**: API gateways and serverless platforms provide built-in retry with backoff; application code does not implement its own retry loops
+1. **Fail fast at the protocol boundary**: Validate inputs and return structured errors before making backend calls
+2. **Retry at the infrastructure layer**: API gateways and serverless platforms provide built-in retry with backoff; the MCP server does not implement its own retry loops
 3. **Degrade gracefully**: If the search index is stale (replication lag), return results with a staleness indicator rather than failing
 4. **Observable failures**: Every error path emits structured logs and increments a metric counter; no silent failures
+5. **Cursor failures are recoverable**: Expired cursor → `CURSOR_EXPIRED` error → agent re-issues query. Not a fatal failure.

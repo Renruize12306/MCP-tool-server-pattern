@@ -1,35 +1,50 @@
-# MCP Tool Access Pattern
+# MCP Tool Server Pattern
 
-A reference architecture for deploying [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers as cloud-native services, enabling AI agents to access organizational tooling — such as code search, document retrieval, and operational data — through a standardized, secure interface. This pattern forms the tool access layer of an **agent-based system**, where autonomous AI agents plan and execute multi-step tasks (e.g., root cause analysis, code review, incident response) by invoking tools programmatically.
+## Introduction
 
-## Motivation
+You have a backend service — a code search engine, a document store, a log query API, or other collection of API services — running locally or behind a REST API. It works, but AI agents can't use it directly. Agents need a **standardized tool interface** with typed inputs/outputs, structured errors, and pagination support.
 
-As AI agents become integral to software engineering workflows, they need structured access to production tooling. MCP provides a protocol-level standard, but deploying MCP servers in production cloud environments introduces challenges around authentication, scalability, latency, and multi-tenant access control.
+**This repository shows you how to wrap an existing backend service as an [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) tool server** — a thin protocol adapter that gives agents structured access to your backend through standardized tool contracts. The same server runs **locally** (stdio, no auth, for development) and **in the cloud** (HTTP, with authentication, for production).
 
-This repository provides **generalized architectural patterns, tool contract templates, deployment guides, and operational checklists** informed by experience in industrial cloud environments. It is intended as a reusable reference for any organization deploying MCP-based agent tooling on cloud infrastructure.
+## The Challenges
+
+Wrapping a backend service as an agent-facing tool server is not just "add an API layer." Several design problems must be solved:
+
+| Challenge | What Goes Wrong Without It |
+|-----------|--------------------------|
+| **Pagination** | Search returns thousands of results. Without cursor-based pagination with server-side state, agents either get truncated results or blow up context windows. |
+| **Authentication** | Locally, no auth is needed. In the cloud, agents authenticate via OAuth2, and the server authenticates to the backend via cloud-native credentials. These are two separate auth layers. |
+| **Input validation** | Agents generate tool calls from LLM output — malformed queries, missing fields, invalid types. Without validation at the tool boundary, bad inputs propagate to the backend. |
+| **Error handling** | Backend returns HTTP 503. The agent needs a structured MCP error code with a request ID, not a raw HTTP response. Without structured error mapping, agents can't reason about failures. |
+| **Dual-mode transport** | Developers test locally via stdio; production uses HTTP+SSE. The tool logic must be identical in both modes — otherwise you get "works locally, breaks in production." |
+| **Data transfer** | Large files/results must be sliced. Without content slicing (line ranges, page ranges), a single retrieval call can return megabytes that exceed agent context limits. |
+
+This repository provides **design patterns, tool contract templates, and architecture guidance** for solving these challenges.
+
+## What This Repository Contains
+
+This is a **design reference**, not a runnable codebase. It includes:
+
+- **Architecture documentation** — three-layer MCP server design (Tool Layer → Request Translation → Error Handling), data flow, and deployment modes
+- **Tool contract templates** — parameterized YAML schemas for search-domain and retrieval-domain tools, with pagination, error codes, and slicing
+- **Design principles** — engineering rationale for thin servers, dual-mode transport, and pagination strategies
 
 ## Repository Structure
 
 ```
-mcp-tool-access-pattern/
-  README.md                               ← You are here
-  LICENSE                                 ← Apache License 2.0
-  NOTICE                                  ← Copyright notice
+MCP-tool-server-pattern/
+  README.md                             <- You are here
+  LICENSE                               <- Apache License 2.0
+  NOTICE                                <- Copyright notice
   docs/
-    architecture.md                       ← System architecture, layers, data flow
-    design-principles.md                  ← Engineering rationale and trade-off analysis
+    architecture.md                     <- MCP server architecture, data flow, deployment modes
+    design-principles.md                <- Engineering rationale and trade-off analysis
   schemas/
-    search-tool-template.yaml             ← MCP tool template: search domain
-    retrieval-tool-template.yaml          ← MCP tool template: knowledge retrieval domain
-    backend-api-template.yaml             ← Backend service API template
-    infrastructure-layer-template.yaml    ← Cloud infrastructure layer template
-  templates/
-    deployment-checklist.md               ← Step-by-step cloud deployment checklist
-    security-audit-checklist.md           ← Security review checklist for MCP deployments
-    infrastructure-config-template.yaml   ← Infrastructure configuration skeleton
+    search-tool-template.yaml           <- MCP tool template: search-domain tools
+    retrieval-tool-template.yaml        <- MCP tool template: retrieval-domain tools
   assets/
-    architecture-overview.svg             ← High-level architecture diagram (rendered)
-    architecture-overview.mmd             ← Mermaid source for the diagram
+    architecture-overview.svg           <- High-level architecture diagram (rendered)
+    architecture-overview.mmd           <- Mermaid source for the diagram
 ```
 
 ## Architecture Overview
@@ -38,44 +53,59 @@ mcp-tool-access-pattern/
 
 > Diagram source: [`assets/architecture-overview.mmd`](assets/architecture-overview.mmd) (Mermaid)
 
+## Concrete Example: Wrapping a Code Search Engine
+
+To make the pattern concrete, here's how it applies to wrapping a code search engine (e.g., Zoekt, Elasticsearch) as an MCP tool server:
+
+| Layer | What It Does | Example |
+|-------|-------------|---------|
+| **Backend** | Runs the search engine, indexes code, serves REST API | Zoekt indexes 500 repos, exposes `/search` and `/list` endpoints |
+| **MCP Tool Layer** | Defines typed tool contracts agents can call | `search` tool: takes `query`, `repo_id`, `max_results`, `cursor` → returns ranked results with `next_cursor` |
+| **Request Translation** | Converts MCP tool call to HTTP request | `search("func main", repo_id="my-repo")` → `POST /search {"query": "func main", "repos": ["my-repo"]}` |
+| **Error Handling** | Maps backend HTTP errors to MCP error codes | HTTP 404 → `NOT_FOUND` (-32001); HTTP 503 → `BACKEND_UNAVAILABLE` (-32002) |
+| **Pagination** | Manages server-side cursor state | First call returns 50 results + `cursor="abc123"`. Next call with `cursor="abc123"` returns next 50. Cursor expires after 15 min (TTL). |
+
+**Local mode**: Developer runs `mcp-server --stdio`, connects from IDE. No auth. Backend runs on localhost.
+
+**Cloud mode**: Server runs as HTTP+SSE behind an API gateway. Agent authenticates via OAuth2 at the gateway. Server authenticates to backend via cloud-native credentials.
+
+| Deployment | Transport | Agent → Server Auth | Server → Backend Auth |
+|-----------|-----------|-------------------|---------------------|
+| Local (stdio) | stdin/stdout JSON-RPC | None (local trust) | None (localhost) |
+| Cloud (HTTP) | HTTP + SSE | OAuth2 at gateway (AWS: Cognito / Azure: Entra ID) | Cloud-native (AWS: IAM SigV4 / Azure: Managed Identity) |
+
 ## Artifact Index
 
 | Artifact | Type | Description |
 |----------|------|-------------|
-| [Architecture](docs/architecture.md) | Documentation | Four-layer component breakdown, data flow, deployment modes |
+| [Architecture](docs/architecture.md) | Documentation | MCP server internal layers, data flow, deployment modes |
 | [Design Principles](docs/design-principles.md) | Documentation | Engineering rationale, trade-off analysis, extensibility guide |
-| [Search Tool Template](schemas/search-tool-template.yaml) | Schema | Parameterized MCP tool template for search-domain servers |
-| [Retrieval Tool Template](schemas/retrieval-tool-template.yaml) | Schema | Parameterized MCP tool template for document retrieval servers |
-| [Backend API Template](schemas/backend-api-template.yaml) | Schema | Backend service REST API endpoint template |
-| [Infrastructure Layer Template](schemas/infrastructure-layer-template.yaml) | Schema | Multi-layer cloud infrastructure template |
-| [Deployment Checklist](templates/deployment-checklist.md) | Template | Step-by-step cloud deployment checklist |
-| [Security Audit Checklist](templates/security-audit-checklist.md) | Template | Security review checklist for MCP deployments |
-| [Infrastructure Config Template](templates/infrastructure-config-template.yaml) | Template | Infrastructure configuration skeleton |
+| [Search Tool Template](schemas/search-tool-template.yaml) | Schema | Parameterized MCP tool template for search-domain tools |
+| [Retrieval Tool Template](schemas/retrieval-tool-template.yaml) | Schema | Parameterized MCP tool template for retrieval-domain tools |
 
 ## Pattern Summary
 
-| Layer | Role | Key Characteristics |
-|-------|------|-------------------|
-| MCP Servers | Protocol adapters between agents and backends | Stateless, thin, dual-mode (stdio/HTTP) |
-| Backend Services | Domain-specific compute (search, indexing) | Single-binary, dual-entrypoint (local/serverless) |
-| Cloud Infrastructure | Networking, storage, compute, access control | Multi-layer, code-defined, scale-to-zero, managed storage |
-| Developer Integration | IDE extensions for local tool access | MCP client, virtual filesystem, search UI |
+A single MCP server exposes multiple **tool categories**, each addressing a different data access pattern:
 
-> For specific technology choices validated in a reference implementation, see the mapping table in [Architecture](docs/architecture.md).
+| Tool Category | Tool Pattern | Pagination | Example Backend |
+|---------------|-------------|------------|-----------------|
+| Search-domain tools | Discovery → search → retrieval | Cursor-based (server-side state, TTL) | Zoekt, Elasticsearch, Sourcegraph |
+| Retrieval-domain tools | List → search metadata → retrieve | Offset-based (stateless) | Document stores, wikis, runbooks |
 
 ## How to Use This Reference
 
-This repository is a **design reference**, not a runnable codebase. It is intended for teams planning MCP-based agent tooling deployments. Suggested usage:
+1. **Start with the architecture** — Read [`docs/architecture.md`](docs/architecture.md) to understand the three-layer server design and data flow.
+2. **Review the design principles** — [`docs/design-principles.md`](docs/design-principles.md) explains the trade-offs behind pagination, auth, and thin server design.
+3. **Adapt the tool templates** — The YAML templates under `schemas/` define parameterized tool contracts with `{{placeholders}}`. Fork these and fill in domain-specific values.
+4. **Extend with new tool categories** — See the "Extensibility" section in [Design Principles](docs/design-principles.md) for guidance on adding new tool categories.
 
-1. **Start with the architecture** — Read [`docs/architecture.md`](docs/architecture.md) to understand the four-layer structure and the two data flow paths (search vs. retrieval). Identify which components apply to your use case.
-2. **Review the design principles** — [`docs/design-principles.md`](docs/design-principles.md) explains the trade-offs behind each decision. Use this to evaluate whether the same trade-offs apply in your environment.
-3. **Adapt the tool templates** — The YAML templates under `schemas/` define parameterized tool contracts with `{{placeholders}}`. Fork these and fill in domain-specific values for your MCP servers.
-4. **Use the checklists for operations** — The deployment and security checklists under `templates/` are directly usable as operational runbooks. Copy and customize for your infrastructure.
-5. **Extend with new MCP servers** — The pattern is designed to be extended. See the "Extensibility" section in [Design Principles](docs/design-principles.md) for guidance on adding new servers.
+## Related Work
+
+For guidance on deploying the MCP server and its backend as cloud-native infrastructure (containerization, serverless compute, managed storage, multi-cloud mapping), see the companion project **[MCP-tool-deployment-pattern](../MCP-tool-deployment-pattern/)**.
 
 ## De-identification Notice
 
-This repository contains **generalized architectural patterns, tool contract templates, and operational checklists** informed by experience in industrial cloud environments. All employer-specific system names, internal URLs, proprietary configurations, and sensitive operational data have been removed. The patterns demonstrated here are applicable to any organization deploying MCP-based agent tooling on cloud infrastructure.
+This repository contains **generalized design patterns and tool contract templates** informed by experience in industrial environments. All employer-specific system names, internal URLs, proprietary configurations, and sensitive operational data have been removed. The patterns demonstrated here are applicable to any organization building MCP tool servers.
 
 ## License
 
